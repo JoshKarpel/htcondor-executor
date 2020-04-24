@@ -7,7 +7,7 @@ import numpy as np
 
 def test_works_as_dask_executor():
     with HTCondorExecutor() as pool:
-        with dask.config.set(pool = pool):
+        with dask.config.set(pool=pool):
             x = da.sum(da.ones(5)) ** 2
             y = x.compute()
 

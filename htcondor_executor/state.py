@@ -27,9 +27,9 @@ from . import htio, utils
 logger = logging.getLogger(__name__)
 
 
-class JobStatus(utils.StrEnum):
+class TaskStatus(utils.StrEnum):
     """
-    An enumeration of the possible statuses that a map component can be in.
+    An enumeration of the possible statuses that a task can be in.
     These are mostly identical to the HTCondor job statuses of the same name.
     """
 
@@ -43,29 +43,19 @@ class JobStatus(utils.StrEnum):
     SUSPENDED = "SUSPENDED"
     ERRORED = "ERRORED"
 
-    @classmethod
-    def display_statuses(cls) -> Tuple["JobStatus", ...]:
-        return (
-            cls.HELD,
-            cls.ERRORED,
-            cls.IDLE,
-            cls.RUNNING,
-            cls.COMPLETED,
-        )
-
 
 JOB_EVENT_STATUS_TRANSITIONS = {
-    htcondor.JobEventType.SUBMIT: JobStatus.IDLE,
-    htcondor.JobEventType.JOB_EVICTED: JobStatus.IDLE,
-    htcondor.JobEventType.JOB_UNSUSPENDED: JobStatus.IDLE,
-    htcondor.JobEventType.JOB_RELEASED: JobStatus.IDLE,
-    htcondor.JobEventType.SHADOW_EXCEPTION: JobStatus.IDLE,
-    htcondor.JobEventType.JOB_RECONNECT_FAILED: JobStatus.IDLE,
-    htcondor.JobEventType.JOB_TERMINATED: JobStatus.COMPLETED,
-    htcondor.JobEventType.EXECUTE: JobStatus.RUNNING,
-    htcondor.JobEventType.JOB_HELD: JobStatus.HELD,
-    htcondor.JobEventType.JOB_SUSPENDED: JobStatus.SUSPENDED,
-    htcondor.JobEventType.JOB_ABORTED: JobStatus.REMOVED,
+    htcondor.JobEventType.SUBMIT: TaskStatus.IDLE,
+    htcondor.JobEventType.JOB_EVICTED: TaskStatus.IDLE,
+    htcondor.JobEventType.JOB_UNSUSPENDED: TaskStatus.IDLE,
+    htcondor.JobEventType.JOB_RELEASED: TaskStatus.IDLE,
+    htcondor.JobEventType.SHADOW_EXCEPTION: TaskStatus.IDLE,
+    htcondor.JobEventType.JOB_RECONNECT_FAILED: TaskStatus.IDLE,
+    htcondor.JobEventType.JOB_TERMINATED: TaskStatus.COMPLETED,
+    htcondor.JobEventType.EXECUTE: TaskStatus.RUNNING,
+    htcondor.JobEventType.JOB_HELD: TaskStatus.HELD,
+    htcondor.JobEventType.JOB_SUSPENDED: TaskStatus.SUSPENDED,
+    htcondor.JobEventType.JOB_ABORTED: TaskStatus.REMOVED,
 }
 
 
@@ -87,7 +77,7 @@ class JobID:
         return hash((self.__class__, self.cluster, self.proc))
 
 
-class JobStateTracker:
+class StateTracker:
     def __init__(self, executor):
         self.executor = executor
 
@@ -95,10 +85,10 @@ class JobStateTracker:
 
         self._jobid_to_taskid: Dict[JobID, executor.TaskID] = {}
 
-        self._task_statuses = collections.defaultdict(lambda: JobStatus.UNMATERIALIZED)
+        self._task_statuses = collections.defaultdict(lambda: TaskStatus.UNMATERIALIZED)
 
     @property
-    def task_statuses(self) -> Mapping[JobID, JobStatus]:
+    def task_statuses(self) -> Mapping[JobID, TaskStatus]:
         self._read_events()
         return dict(self._task_statuses)
 
@@ -129,6 +119,7 @@ class JobStateTracker:
             task = self.executor.tasks[task_id]
 
             if event.type is htcondor.JobEventType.JOB_HELD:
+                # TODO: turn this into an appropriate exception on the future
                 raise Exception("job held")
 
             new_status = JOB_EVENT_STATUS_TRANSITIONS.get(event.type, None)
@@ -141,7 +132,7 @@ class JobStateTracker:
                 else:
                     self._task_statuses[task_id] = new_status
 
-                    if new_status is JobStatus.COMPLETED:
+                    if new_status is TaskStatus.COMPLETED:
                         x = htio.load_objects(task.output_path)
                         status = next(x)
                         output = next(x)

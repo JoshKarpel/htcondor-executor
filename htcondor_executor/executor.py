@@ -21,7 +21,7 @@ RUN_SCRIPT = Path(__file__).parent / "run" / "run.py"
 
 
 class HTCondorExecutor(Executor):
-    def __init__(self, dir = None, max_jobs = 100, persist_data_after_close = False):
+    def __init__(self, dir=None, max_jobs=100, persist_data_after_close=False):
         self._parent_dir = dir
         self._dir = None
 
@@ -30,7 +30,7 @@ class HTCondorExecutor(Executor):
 
         self.persist_data_after_close = persist_data_after_close
 
-        self._tracker = state.JobStateTracker(self)
+        self._tracker = state.StateTracker(self)
 
         self.tasks = {}
         self.task_queue = queue.Queue()
@@ -38,10 +38,10 @@ class HTCondorExecutor(Executor):
         self._shutdown = False
 
         self._submit_worker = threading.Thread(
-            target = _submit_worker, args = (self,), daemon = True
+            target=_submit_worker, args=(self,), daemon=True
         )
         self._tracking_worker = threading.Thread(
-            target = _tracking_worker, args = (self,), daemon = True
+            target=_tracking_worker, args=(self,), daemon=True
         )
 
     def submit(self, fn, *args, **kwargs):
@@ -53,14 +53,20 @@ class HTCondorExecutor(Executor):
 
         return f
 
-    def apply_async(self, fn, args = None, kwargs = None, callback = None):
+    def apply_async(
+        self, fn, args=None, kwargs=None, callback=None, error_callback=None
+    ):
         args = args or ()
         kwargs = kwargs or {}
 
         f = self.submit(fn, *args, **kwargs)
-        r = MyApplyResult(f, callback)
+        r = ApplyResultAdapter(f)
 
-        f.add_done_callback(lambda f: callback(r.get()))
+        f.add_done_callback(
+            lambda f: callback(f.result())
+            if f._exception is None
+            else error_callback(f.exception())
+        )
 
         return r
 
@@ -89,12 +95,12 @@ class HTCondorExecutor(Executor):
 
     def __enter__(self):
         self.__dir = tempfile.TemporaryDirectory(
-            prefix = "htcondor-executor_", dir = self._parent_dir
+            prefix="htcondor-executor_", dir=self._parent_dir
         )
         self.__dir.__enter__()
         self._dir = Path(self.__dir.name)
 
-        self._event_log_path.touch(exist_ok = True)
+        self._event_log_path.touch(exist_ok=True)
 
         shutil.copy2(RUN_SCRIPT, self._run_script_path)
 
@@ -110,33 +116,35 @@ class HTCondorExecutor(Executor):
 
 
 def _submit_worker(executor: HTCondorExecutor):
-    while True:
-        if executor._shutdown:
-            print("submit worker shutting down")
-            return
+    while not executor._shutdown:
+        _do_submit_work(executor)
+    print("submit worker shutting down")
 
-        try:
-            t = executor.task_queue.get(timeout = 1)
-        except queue.Empty:
-            continue
 
-        t.write_files()
+def _do_submit_work(executor):
+    try:
+        t = executor.task_queue.get(timeout=1)
+    except queue.Empty:
+        return
 
-        schedd = htcondor.Schedd()
-        with schedd.transaction() as txn:
-            cluster_id = t.submit_description().queue(txn, 1, )
+    t.write_files()
 
-        t.job_id = state.JobID(cluster_id, 0)
-        t.future.set_running_or_notify_cancel()
+    # https://github.com/python/cpython/blob/master/Lib/concurrent/futures/_base.py#L478
+    if not t.future.set_running_or_notify_cancel():
+        return
+
+    schedd = htcondor.Schedd()
+    with schedd.transaction() as txn:
+        cluster_id = t.submit_description().queue(txn, 1,)
+
+    t.job_id = state.JobID(cluster_id, 0)
 
 
 def _tracking_worker(executor: HTCondorExecutor):
-    while True:
-        if executor._shutdown:
-            print("tracking worker shutting down")
-            return
+    while not executor._shutdown:
+        executor._tracker._read_events(timeout=1)
 
-        executor._tracker._read_events(timeout = 1)
+    print("tracking worker shutting down")
 
 
 TRANSFER_DIR = "_htcondor_executor_transfer"
@@ -174,7 +182,7 @@ class Task:
         return self.dir / "stderr"
 
     def write_files(self):
-        self.dir.mkdir(parents = True, exist_ok = True)
+        self.dir.mkdir(parents=True, exist_ok=True)
         htio.save_object(
             (self.fn, self.args, self.kwargs), self.dir / "fn_args_kwargs",
         )
@@ -202,62 +210,24 @@ class Task:
         )
 
 
-def wait_for_path_to_exist(
-    path: Path,
-    timeout: Optional[Union[int, float, datetime.timedelta]] = None,
-    wait_time: Optional[Union[int, float, datetime.timedelta]] = 1,
-) -> None:
-    """
-    Waits for the path `path` to exist.
-
-    Parameters
-    ----------
-    path
-        The target path to watch.
-    timeout
-        The maximum amount of time to wait for the path to exist before raising a :class:`htmap.exceptions.TimeoutError`.
-    wait_time
-        The time to wait between checks.
-    """
-    timeout = timeout_to_seconds(timeout)
-    wait_time = timeout_to_seconds(wait_time) or 0.01  # minimum wait time
-
-    start_time = time.time()
-    while not path.exists():
-        if timeout is not None and (timeout <= 0 or time.time() > start_time + timeout):
-            raise TimeoutError(f"Timeout while waiting for {path} to exist")
-        time.sleep(wait_time)
-
-
-def timeout_to_seconds(
-    timeout: Optional[Union[int, float, datetime.timedelta]]
-) -> Optional[float]:
-    """
-    Coerce a timeout given as a :class:`datetime.timedelta` or an :class:`int` to a number of seconds as a :class:`float`.
-    ``None`` is passed through.
-    """
-    if timeout is None:
-        return timeout
-    if isinstance(timeout, datetime.timedelta):
-        return timeout.total_seconds()
-    return float(timeout)
-
-
-class MyApplyResult(ApplyResult):
-    def __init__(self, future, callback):
+class ApplyResultAdapter:
+    def __init__(self, future):
         self.future = future
-        self._callback = callback
-        self._event = threading.Event()
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(future={self.future})"
 
     def get(self, timeout=None):
-        return self.future.result(timeout = timeout)
+        return self.future.result(timeout=timeout)
 
     def ready(self):
         return self.future.done()
 
     @property
-    def _success(self):
-        return self.future._exception == FINISHED
+    def successful(self):
+        if not self.ready():
+            raise ValueError(f"{repr(self)} is not ready yet!")
+        return self.future._exception is FINISHED
 
     def wait(self, timeout=None):
-        wait(self.future, timeout = timeout)
+        wait(self.future, timeout=timeout)
