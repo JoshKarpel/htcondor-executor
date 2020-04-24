@@ -1,0 +1,2 @@
+htcondor >= 8.8.0
+cloudpickle ~= 1.3
